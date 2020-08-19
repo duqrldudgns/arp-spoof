@@ -3,10 +3,12 @@
 #include <unistd.h>
 #include "pkt.h"
 
-char local_ip[16];
+Ip local_ip;
 Mac local_mac;
+EthArpPacket request_packet;
+EthArpPacket *reply_packet;
 
-void GetLocalAddr(char *dev, const char *hw){
+void GetLocalAddr(const char *dev, const char *hw){
     int fd;
     struct ifreq ifr;
     fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -22,12 +24,12 @@ void GetLocalAddr(char *dev, const char *hw){
     if( !memcmp(hw, "ip", 2) ){
         ioctl(fd, SIOCGIFADDR, &ifr);
         close(fd);
-        sprintf(local_ip, "%s", inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+        local_ip = Ip(inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
     }
 }
 
-void packet_setting(EthArpPacket &packet, uint8_t *dmac, uint16_t op, char *sip, uint8_t *tmac, char *tip){
-    packet.eth_.dmac_ = Mac(dmac);
+void packet_setting(EthArpPacket &packet, Mac dmac, uint16_t op, Ip sip, Mac tmac, Ip tip){
+    packet.eth_.dmac_ = dmac;
     //packet.eth_.smac_ = Mac(local_mac);
     packet.eth_.smac_ = local_mac;
     packet.eth_.type_ = htons(EthHdr::Arp);
@@ -39,22 +41,47 @@ void packet_setting(EthArpPacket &packet, uint8_t *dmac, uint16_t op, char *sip,
     packet.arp_.op_ = htons(op);
     //packet.arp_.smac_ = Mac(local_mac);
     packet.arp_.smac_ = local_mac;
-    packet.arp_.sip_ = htonl(Ip(sip));
-    packet.arp_.tmac_ = Mac(tmac);
-    packet.arp_.tip_ = htonl(Ip(tip));
+    packet.arp_.sip_ = htonl(sip);
+    packet.arp_.tmac_ = tmac;
+    packet.arp_.tip_ = htonl(tip);
 }
 
-void send_packet(EthArpPacket packet, pcap_t* handle){
+void send_packet(char *op, EthArpPacket packet, pcap_t* handle, int cnt){
     int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
     if (res != 0) {
         fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
     }
-    printf("send packet success !!\n");
+    printf("session_%d : send %s packet success !!\n", cnt, op);
 }
 
-int check_reply_packet(EthArpPacket attack_packet , EthArpPacket request_packet){
-    return attack_packet.eth_.type_ == htons(EthHdr::Arp) &&
-           attack_packet.arp_.op_ == htons(ArpHdr::Reply) &&
-           request_packet.eth_.smac() == attack_packet.eth_.dmac() &&
-           request_packet.arp_.sip() == attack_packet.arp_.tip();
+int check_reply_packet(EthArpPacket reply_packet , EthArpPacket request_packet){
+    return reply_packet.eth_.type_ == htons(EthHdr::Arp) &&
+           reply_packet.arp_.op_ == htons(ArpHdr::Reply) &&
+           request_packet.eth_.smac() == reply_packet.eth_.dmac() &&
+           request_packet.arp_.sip() == reply_packet.arp_.tip();
+}
+
+void get_session_mac(Ip ip, Mac &mac, pcap_t* handle, int i){
+    request_packet.arp_.tip_ = htonl(Ip(ip));           //set request_arp_tip = session_ip
+    send_packet((char *)"request", request_packet, handle, i+1);                    //send request packet
+
+    while(true) {                                              //for find arp reply packet
+        struct pcap_pkthdr* header;
+        const u_char* packet;
+        int res = pcap_next_ex(handle, &header, &packet);
+        if (res == 0) continue;
+        if (res == -1 || res == -2) {
+            printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
+            break;
+        }
+
+        reply_packet = (EthArpPacket *)packet;
+        if( check_reply_packet(*reply_packet, request_packet) ){   //find arp reply packet
+            printf("session_%d : arp reply packet catch !! \n", i+1);
+
+            mac = reply_packet->arp_.smac();            //get session's mac address
+            break;
+        }
+        printf("Looking for a arp reply packet.. \n");
+    }
 }
